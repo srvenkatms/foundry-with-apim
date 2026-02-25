@@ -1,0 +1,176 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.40.2.10011",
+      "templateHash": "14812336091203823127"
+    }
+  },
+  "definitions": {
+    "aiModelTDeploymentType": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "metadata": {
+            "description": "The name of the deployment"
+          }
+        },
+        "properties": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "metadata": {
+                    "description": "The name of the model - often the same as the deployment name"
+                  }
+                },
+                "version": {
+                  "type": "string",
+                  "metadata": {
+                    "description": "The version of the model, e.g. \"2024-11-20\" or \"0125\""
+                  }
+                },
+                "format": {
+                  "type": "string",
+                  "allowedValues": [
+                    "Cohere",
+                    "OpenAI"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "sku": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "allowedValues": [
+                "GlobalStandard",
+                "Standard"
+              ]
+            },
+            "capacity": {
+              "type": "int"
+            }
+          },
+          "nullable": true
+        }
+      },
+      "metadata": {
+        "__bicep_imported_from!": {
+          "sourceTemplate": "ai-foundry.bicep"
+        }
+      }
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {}
+    },
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "The name of the Azure OpenAI account to create."
+      }
+    },
+    "publicNetworkAccess": {
+      "type": "string",
+      "defaultValue": "Enabled",
+      "allowedValues": [
+        "Disabled",
+        "Enabled"
+      ]
+    },
+    "sku": {
+      "type": "object",
+      "defaultValue": {
+        "name": "S0"
+      }
+    },
+    "deployments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/aiModelTDeploymentType"
+      },
+      "defaultValue": [],
+      "metadata": {
+        "description": "Model deployments to create in the Azure OpenAI account."
+      }
+    }
+  },
+  "resources": {
+    "account": {
+      "type": "Microsoft.CognitiveServices/accounts",
+      "apiVersion": "2025-04-01-preview",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "kind": "OpenAI",
+      "sku": "[parameters('sku')]",
+      "properties": {
+        "publicNetworkAccess": "[parameters('publicNetworkAccess')]",
+        "customSubDomainName": "[toLower(parameters('name'))]"
+      }
+    },
+    "modelDeployments": {
+      "copy": {
+        "name": "modelDeployments",
+        "count": "[length(parameters('deployments'))]",
+        "mode": "serial",
+        "batchSize": 1
+      },
+      "type": "Microsoft.CognitiveServices/accounts/deployments",
+      "apiVersion": "2025-06-01",
+      "name": "[format('{0}/{1}', parameters('name'), parameters('deployments')[copyIndex()].name)]",
+      "properties": "[parameters('deployments')[copyIndex()].properties]",
+      "sku": "[coalesce(tryGet(parameters('deployments')[copyIndex()], 'sku'), createObject('name', 'Standard', 'capacity', 20))]",
+      "dependsOn": [
+        "account"
+      ]
+    }
+  },
+  "outputs": {
+    "OPENAI_ENDPOINT": {
+      "type": "string",
+      "metadata": {
+        "description": "The endpoint URL of the Azure OpenAI account."
+      },
+      "value": "[reference('account').endpoint]"
+    },
+    "OPENAI_RESOURCE_ID": {
+      "type": "string",
+      "metadata": {
+        "description": "The resource ID of the Azure OpenAI account."
+      },
+      "value": "[resourceId('Microsoft.CognitiveServices/accounts', parameters('name'))]"
+    },
+    "OPENAI_NAME": {
+      "type": "string",
+      "metadata": {
+        "description": "The name of the Azure OpenAI account."
+      },
+      "value": "[parameters('name')]"
+    },
+    "OPENAI_LOCATION": {
+      "type": "string",
+      "metadata": {
+        "description": "The location of the Azure OpenAI account."
+      },
+      "value": "[reference('account', '2025-04-01-preview', 'full').location]"
+    }
+  }
+}

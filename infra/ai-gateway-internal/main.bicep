@@ -7,15 +7,27 @@
 targetScope = 'resourceGroup'
 
 param location string = resourceGroup().location
-param openAiApiBase string
-param openAiResourceId string
+
+@description('Endpoint URL of an existing Azure OpenAI resource (e.g. the landing-zone OpenAI). Leave empty to provision a new Azure OpenAI resource automatically.')
+param openAiApiBase string = ''
+
+@description('Full resource ID of an existing Azure OpenAI resource. Leave empty to provision a new Azure OpenAI resource automatically.')
+param openAiResourceId string = ''
+
 param openAiLocation string = location
 param existingFoundryName string?
 param projectsCount int = 3
 
-var valid_config = empty(openAiApiBase) || empty(openAiResourceId)
-  ? fail('OPENAI_API_BASE and OPENAI_RESOURCE_ID environment variables must be set.')
-  : true
+@description('Optional name for the Azure OpenAI resource created when openAiApiBase / openAiResourceId are not supplied. A unique name is generated if omitted.')
+param openAiName string = ''
+
+// When both OpenAI params are provided use them; when both are absent create a
+// new resource inline.  Any other combination is a configuration error.
+var hasExistingOpenAi = !empty(openAiApiBase) && !empty(openAiResourceId)
+var createNewOpenAi = empty(openAiApiBase) && empty(openAiResourceId)
+var valid_config = hasExistingOpenAi || createNewOpenAi
+  ? true
+  : fail('Either provide both OPENAI_API_BASE and OPENAI_RESOURCE_ID, or leave both empty to create a new Azure OpenAI resource automatically.')
 
 var tags = {
   'created-by': 'option-ai-gateway-internal'
@@ -25,10 +37,7 @@ var tags = {
 }
 
 var resourceToken = toLower(uniqueString(resourceGroup().id, location))
-var openAiParts = split(openAiResourceId, '/')
-var openAiName = last(openAiParts)
-var openAiSubscriptionId = openAiParts[2]
-var openAiResourceGroupName = openAiParts[4]
+var resolvedOpenAiName = empty(openAiName) ? 'openai-${resourceToken}' : openAiName
 
 module foundry_identity '../modules/iam/identity.bicep' = {
   name: 'foundry-identity-deployment'
@@ -38,6 +47,65 @@ module foundry_identity '../modules/iam/identity.bicep' = {
     identityName: 'foundry-${resourceToken}-identity'
   }
 }
+
+// When no external OpenAI resource is provided, provision one in this resource group.
+module openai_prereq '../modules/ai/openai-account.bicep' = if (createNewOpenAi) {
+  name: 'openai-prereq-deployment'
+  params: {
+    tags: tags
+    location: location
+    name: resolvedOpenAiName
+    deployments: [
+      {
+        name: 'gpt-4.1-mini'
+        properties: {
+          model: {
+            name: 'gpt-4.1-mini'
+            version: '2025-01-01-preview'
+            format: 'OpenAI'
+          }
+        }
+      }
+      {
+        name: 'gpt-4o'
+        properties: {
+          model: {
+            name: 'gpt-4o'
+            version: '2025-01-01-preview'
+            format: 'OpenAI'
+          }
+        }
+      }
+      {
+        name: 'o3-mini'
+        properties: {
+          model: {
+            name: 'o3-mini'
+            version: '2025-01-01-preview'
+            format: 'OpenAI'
+          }
+        }
+      }
+    ]
+  }
+}
+
+// Resolve the OpenAI values – from the inline-created resource or from params.
+var resolvedOpenAiResourceId = createNewOpenAi ? openai_prereq.outputs.OPENAI_RESOURCE_ID : openAiResourceId
+var resolvedOpenAiApiBase = createNewOpenAi ? openai_prereq.outputs.OPENAI_ENDPOINT : openAiApiBase
+var resolvedOpenAiLocation = createNewOpenAi ? openai_prereq.outputs.OPENAI_LOCATION : openAiLocation
+
+// These variables are derived purely from the input params (not from module outputs)
+// so they are safe to use in module scopes and for the private endpoint.
+var existingOpenAiParts = split(openAiResourceId, '/')
+var existingOpenAiAccountName = empty(openAiResourceId) ? '' : last(existingOpenAiParts)
+var existingOpenAiSubscriptionId = empty(openAiResourceId) ? subscription().subscriptionId : existingOpenAiParts[2]
+var existingOpenAiResourceGroupName = empty(openAiResourceId) ? resourceGroup().name : existingOpenAiParts[4]
+
+// Resolved account name used in module params (can reference module output when inline)
+var openAiAccountName = createNewOpenAi ? resolvedOpenAiName : existingOpenAiAccountName
+var openAiSubscriptionId = existingOpenAiSubscriptionId
+var openAiResourceGroupName = existingOpenAiResourceGroupName
 
 // vnet doesn't have to be in the same RG as the AI Services
 // each foundry needs it's own delegated subnet, projects inside of one Foundry share the subnet for the Agents Service
@@ -70,13 +138,14 @@ module openai_private_endpoint '../modules/networking/ai-pe-dns.bicep' = {
   params: {
     tags: tags
     location: location
-    aiAccountName: openAiName
+    aiAccountName: openAiAccountName
     aiAccountNameResourceGroup: openAiResourceGroupName
     aiAccountSubscriptionId: openAiSubscriptionId
     peSubnetId: vnet.outputs.VIRTUAL_NETWORK_SUBNETS.peSubnet.resourceId
     resourceToken: resourceToken
     existingDnsZones: ai_dependencies.outputs.DNS_ZONES
   }
+  dependsOn: [openai_prereq]
 }
 
 // --------------------------------------------------------------------------------------------------------------
@@ -233,21 +302,32 @@ module ai_gateway '../modules/apim/ai-gateway-internal.bicep' = {
     ]
     aiServicesConfig: [
       {
-        name: openAiName
-        resourceId: openAiResourceId
-        endpoint: openAiApiBase
-        location: openAiLocation
+        name: openAiAccountName
+        resourceId: resolvedOpenAiResourceId
+        endpoint: resolvedOpenAiApiBase
+        location: resolvedOpenAiLocation
       }
     ]
   }
   dependsOn: [foundry ?? fake_foundry]
 }
 
-module apim_role_assignment '../modules/iam/role-assignment-cognitiveServices.bicep' = {
-  name: 'apim-role-assignment-deployment-${resourceToken}'
-  scope: resourceGroup(openAiSubscriptionId, openAiResourceGroupName)
+// Role assignment for an inline-created OpenAI resource (same resource group – no scope override).
+module apim_role_assignment_inline '../modules/iam/role-assignment-cognitiveServices.bicep' = if (createNewOpenAi) {
+  name: 'apim-role-assignment-inline-deployment-${resourceToken}'
   params: {
-    accountName: openAiName
+    accountName: resolvedOpenAiName
+    projectPrincipalId: ai_gateway.outputs.apimPrincipalId
+    roleName: 'Cognitive Services User'
+  }
+}
+
+// Role assignment for an existing / landing-zone OpenAI resource (potentially different subscription/RG).
+module apim_role_assignment_existing '../modules/iam/role-assignment-cognitiveServices.bicep' = if (!createNewOpenAi) {
+  name: 'apim-role-assignment-existing-deployment-${resourceToken}'
+  scope: resourceGroup(existingOpenAiSubscriptionId, existingOpenAiResourceGroupName)
+  params: {
+    accountName: existingOpenAiAccountName
     projectPrincipalId: ai_gateway.outputs.apimPrincipalId
     roleName: 'Cognitive Services User'
   }
