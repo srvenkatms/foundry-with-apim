@@ -59,6 +59,12 @@ param apimv2SubnetPrefix string = ''
 @description('Address prefix for the APIM v2 Premium subnet')
 param apimv2PremiumSubnetPrefix string = ''
 
+@description('Address prefix for the Azure Bastion subnet')
+param bastionSubnetPrefix string = ''
+
+@description('Address prefix for the Jump Box subnet')
+param jumpBoxSubnetPrefix string = ''
+
 var is_vnet_address_prefix_valid = int(split(vnetAddress, '/')[1]) <= 21
   ? true
   : fail('VNet address prefix must be /21 or larger (e.g., /16, /20)')
@@ -79,6 +85,12 @@ var laSubnetName = 'logic-apps-subnet'
 
 var acaSubnet = cidrSubnet(vnetAddress, 24, extraAgentSubnets + 7)
 var acaSubnetName = 'aca-subnet'
+
+var bastionSubnet = empty(bastionSubnetPrefix) ? cidrSubnet(vnetAddress, 26, extraAgentSubnets + 8) : bastionSubnetPrefix
+var bastionSubnetName = 'AzureBastionSubnet' // Must be this exact name
+
+var jumpBoxSubnet = empty(jumpBoxSubnetPrefix) ? cidrSubnet(vnetAddress, 24, extraAgentSubnets + 9) : jumpBoxSubnetPrefix
+var jumpBoxSubnetName = 'jumpbox-subnet'
 
 var extraAgentSubnetNames = [for i in range(0, extraAgentSubnets): '${agentSubnetName}-${i + 1}']
 var extraAgentSubnetObjects = [
@@ -153,6 +165,146 @@ module apimSecurityGroup 'apim-nsg.bicep' = {
   }
 }
 
+module bastionNsg 'br/public:avm/res/network/network-security-group:0.5.2' = {
+  name: 'bastionNsgDeployment'
+  params: {
+    name: 'bastion-nsg'
+    location: location
+    tags: tags
+    securityRules: [
+      {
+        name: 'AllowHttpsInbound'
+        properties: {
+          priority: 120
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'Internet'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'AllowGatewayManagerInbound'
+        properties: {
+          priority: 130
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'GatewayManager'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'AllowAzureLoadBalancerInbound'
+        properties: {
+          priority: 140
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'AzureLoadBalancer'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'AllowBastionHostCommunication'
+        properties: {
+          priority: 150
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: '*'
+          sourceAddressPrefix: 'VirtualNetwork'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'VirtualNetwork'
+          destinationPortRanges: ['8080', '5701']
+        }
+      }
+      {
+        name: 'AllowSshRdpOutbound'
+        properties: {
+          priority: 100
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: '*'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'VirtualNetwork'
+          destinationPortRanges: ['22', '3389']
+        }
+      }
+      {
+        name: 'AllowAzureCloudOutbound'
+        properties: {
+          priority: 110
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'AzureCloud'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'AllowBastionCommunication'
+        properties: {
+          priority: 120
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: '*'
+          sourceAddressPrefix: 'VirtualNetwork'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'VirtualNetwork'
+          destinationPortRanges: ['8080', '5701']
+        }
+      }
+      {
+        name: 'AllowGetSessionInformation'
+        properties: {
+          priority: 130
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: '*'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'Internet'
+          destinationPortRange: '80'
+        }
+      }
+    ]
+  }
+}
+
+module jumpBoxNsg 'br/public:avm/res/network/network-security-group:0.5.2' = {
+  name: 'jumpBoxNsgDeployment'
+  params: {
+    name: 'jumpbox-nsg'
+    location: location
+    tags: tags
+    securityRules: [
+      {
+        name: 'DenyDirectRdpSshInbound'
+        properties: {
+          priority: 100
+          direction: 'Inbound'
+          access: 'Deny'
+          protocol: '*'
+          sourceAddressPrefix: 'Internet'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRanges: ['22', '3389']
+          description: 'Deny direct RDP/SSH from Internet - use Bastion'
+        }
+      }
+    ]
+  }
+}
+
 module virtualNetwork 'br/public:avm/res/network/virtual-network:0.7.2' = {
   name: '${vnetName}-virtual-network-deployment'
   params: {
@@ -208,6 +360,16 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.7.2' = {
         networkSecurityGroupResourceId: networkSecurityGroup.outputs.resourceId
         delegation: 'Microsoft.app/environments'
       }
+      {
+        name: bastionSubnetName
+        addressPrefix: bastionSubnet
+        networkSecurityGroupResourceId: bastionNsg.outputs.resourceId
+      }
+      {
+        name: jumpBoxSubnetName
+        addressPrefix: jumpBoxSubnet
+        networkSecurityGroupResourceId: jumpBoxNsg.outputs.resourceId
+      }
     ])
   }
 }
@@ -242,6 +404,10 @@ type SubnetsType = {
   logicAppsSubnet: SubnetInfoType
   @description('The Azure Container Apps Subnet information')
   acaSubnet: SubnetInfoType
+  @description('The Azure Bastion Subnet information')
+  bastionSubnet: SubnetInfoType
+  @description('The Jump Box Subnet information')
+  jumpBoxSubnet: SubnetInfoType
   @description('Additional Agent Subnets information')
   extraAgentSubnets: SubnetInfoType[]
 }
@@ -278,6 +444,14 @@ output VIRTUAL_NETWORK_SUBNETS SubnetsType = {
   acaSubnet: {
     name: acaSubnetName
     resourceId: '${virtualNetwork.outputs.resourceId}/subnets/${acaSubnetName}'
+  }
+  bastionSubnet: {
+    name: bastionSubnetName
+    resourceId: '${virtualNetwork.outputs.resourceId}/subnets/${bastionSubnetName}'
+  }
+  jumpBoxSubnet: {
+    name: jumpBoxSubnetName
+    resourceId: '${virtualNetwork.outputs.resourceId}/subnets/${jumpBoxSubnetName}'
   }
   extraAgentSubnets: extraAgentSubnetsArray
 }
